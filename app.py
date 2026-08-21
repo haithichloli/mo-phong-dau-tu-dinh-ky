@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from threading import RLock
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from matplotlib.ticker import FuncFormatter
 
 
 st.set_page_config(
@@ -31,6 +34,15 @@ MAU_KENH = {
     "Bitcoin": "#EA580C",
 }
 
+TEN_COT_DU_PHONG = {
+    "Chứng khoán Việt Nam (ETF VN30)": "ETF_VN30",
+    "Chứng khoán Mỹ (S&P 500)": "SP500",
+    "Vàng": "VANG",
+    "Bitcoin": "BITCOIN",
+}
+
+KHOA_MATPLOTLIB = RLock()
+
 
 @dataclass
 class KetQuaMoPhong:
@@ -53,41 +65,63 @@ def dinh_dang_vnd(so_tien: float) -> str:
 
 
 @st.cache_data(ttl="6h", show_spinner=False)
-def tai_loi_suat_thang(ticker: str, giai_doan: str) -> tuple[np.ndarray, str]:
-    """Tải giá lịch sử và chuyển thành chuỗi lợi suất theo tháng."""
-    du_lieu = yf.download(
-        ticker,
-        period=giai_doan,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
+def tai_loi_suat_thang(
+    ten_kenh: str, ticker: str, giai_doan: str
+) -> tuple[np.ndarray, str]:
+    """Tải lợi suất tháng; tự dùng dữ liệu đóng gói nếu Yahoo tạm lỗi."""
+    try:
+        du_lieu = yf.download(
+            ticker,
+            period=giai_doan,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
 
-    if du_lieu.empty or "Close" not in du_lieu.columns:
-        raise ValueError("Không tải được dữ liệu giá.")
+        if du_lieu.empty or "Close" not in du_lieu.columns:
+            raise ValueError("Không tải được dữ liệu giá.")
 
-    gia_dong_cua = du_lieu["Close"]
-    if isinstance(gia_dong_cua, pd.DataFrame):
-        gia_dong_cua = gia_dong_cua.iloc[:, 0]
+        gia_dong_cua = du_lieu["Close"]
+        if isinstance(gia_dong_cua, pd.DataFrame):
+            gia_dong_cua = gia_dong_cua.iloc[:, 0]
 
-    gia_dong_cua = pd.to_numeric(gia_dong_cua, errors="coerce").dropna()
-    gia_dong_cua.index = pd.to_datetime(gia_dong_cua.index)
+        gia_dong_cua = pd.to_numeric(gia_dong_cua, errors="coerce").dropna()
+        gia_dong_cua.index = pd.to_datetime(gia_dong_cua.index)
+        gia_thang = gia_dong_cua.resample("ME").last().dropna()
+        loi_suat = gia_thang.pct_change(fill_method=None).dropna()
+        loi_suat = loi_suat[np.isfinite(loi_suat) & (loi_suat > -0.999)]
 
-    gia_thang = gia_dong_cua.resample("ME").last().dropna()
-    loi_suat = gia_thang.pct_change(fill_method=None).dropna()
+        if len(loi_suat) < 24:
+            raise ValueError("Dữ liệu lịch sử có ít hơn 24 tháng.")
 
-    # Loại bỏ dữ liệu hỏng; mức giảm 100% không thể tiếp tục mô phỏng.
-    loi_suat = loi_suat[
-        np.isfinite(loi_suat) & (loi_suat > -0.999)
-    ]
+        ngay_cuoi = gia_thang.index[-1].strftime("%d/%m/%Y")
+        return (
+            loi_suat.to_numpy(dtype=float),
+            f"Yahoo Finance · dữ liệu đến {ngay_cuoi}",
+        )
+    except Exception:
+        tep_du_phong = Path(__file__).parent / "data" / "historical_monthly_returns.csv"
+        if ten_kenh not in TEN_COT_DU_PHONG or not tep_du_phong.exists():
+            raise
 
-    if len(loi_suat) < 24:
-        raise ValueError("Dữ liệu lịch sử có ít hơn 24 tháng.")
+        bang = pd.read_csv(tep_du_phong, parse_dates=["Ngay"], index_col="Ngay")
+        loi_suat = pd.to_numeric(
+            bang[TEN_COT_DU_PHONG[ten_kenh]], errors="coerce"
+        ).dropna()
+        if giai_doan in {"5y", "10y"}:
+            so_nam = int(giai_doan.removesuffix("y"))
+            moc = loi_suat.index.max() - pd.DateOffset(years=so_nam)
+            loi_suat = loi_suat[loi_suat.index >= moc]
+        loi_suat = loi_suat[np.isfinite(loi_suat) & (loi_suat > -0.999)]
+        if len(loi_suat) < 24:
+            raise ValueError("Dữ liệu dự phòng có ít hơn 24 tháng.")
 
-    ngay_cuoi = gia_thang.index[-1].strftime("%d/%m/%Y")
-    nguon = f"Yahoo Finance · dữ liệu đến {ngay_cuoi}"
-    return loi_suat.to_numpy(dtype=float), nguon
+        ngay_cuoi = loi_suat.index[-1].strftime("%d/%m/%Y")
+        return (
+            loi_suat.to_numpy(dtype=float),
+            f"Bản dữ liệu Yahoo Finance dự phòng · đến {ngay_cuoi}",
+        )
 
 
 def mo_phong_tu_loi_suat(
@@ -157,7 +191,13 @@ def mo_phong_tiet_kiem(
     )
 
 
-def bieu_do_dai_kich_ban(ket_qua: KetQuaMoPhong) -> go.Figure:
+def dinh_dang_truc_tien(so_tien: float, _vi_tri: int) -> str:
+    if abs(so_tien) >= 1_000_000_000:
+        return f"{so_tien / 1_000_000_000:.1f} tỷ"
+    return f"{so_tien / 1_000_000:.0f} tr"
+
+
+def bieu_do_dai_kich_ban(ket_qua: KetQuaMoPhong):
     thang = np.arange(ket_qua.duong_di.shape[1])
     nam = thang / 12
     p5 = np.percentile(ket_qua.duong_di, 5, axis=0)
@@ -165,126 +205,77 @@ def bieu_do_dai_kich_ban(ket_qua: KetQuaMoPhong) -> go.Figure:
     p95 = np.percentile(ket_qua.duong_di, 95, axis=0)
     mau = MAU_KENH.get(ket_qua.ten_kenh, "#2563EB")
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=nam,
-            y=p95,
-            line={"width": 0},
-            hoverinfo="skip",
-            showlegend=False,
-            name="Phân vị 95%",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=nam,
-            y=p5,
-            fill="tonexty",
-            fillcolor="rgba(37, 99, 235, 0.16)",
-            line={"width": 0},
-            name="Khoảng kịch bản 5%–95%",
-            hovertemplate="Năm %{x:.1f}<br>Kịch bản thấp: %{y:,.0f} ₫<extra></extra>",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=nam,
-            y=p50,
-            line={"color": mau, "width": 3},
-            name="Giá trị trung vị",
-            hovertemplate="Năm %{x:.1f}<br>Trung vị: %{y:,.0f} ₫<extra></extra>",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=nam,
-            y=ket_qua.tong_von,
-            line={"color": "#475569", "width": 2, "dash": "dash"},
-            name="Tổng vốn đã góp",
-            hovertemplate="Năm %{x:.1f}<br>Vốn góp: %{y:,.0f} ₫<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        title=f"Dải kịch bản — {ket_qua.ten_kenh}",
-        xaxis_title="Số năm",
-        yaxis_title="Giá trị danh mục (VND)",
-        hovermode="x unified",
-        template="plotly_white",
-        legend={"orientation": "h", "y": -0.22},
-        margin={"l": 20, "r": 20, "t": 60, "b": 80},
-    )
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    fig.patch.set_facecolor("white")
+    ax.fill_between(nam, p5, p95, color="#93C5FD", alpha=0.35,
+                    label="Khoảng kịch bản 5%–95%")
+    ax.plot(nam, p50, color=mau, linewidth=2.6, label="Giá trị trung vị")
+    ax.plot(nam, ket_qua.tong_von, color="#475569", linewidth=2,
+            linestyle="--", label="Tổng vốn đã góp")
+    ax.set_title(f"Dải kịch bản — {ket_qua.ten_kenh}", fontweight="bold")
+    ax.set_xlabel("Số năm")
+    ax.set_ylabel("Giá trị danh mục")
+    ax.yaxis.set_major_formatter(FuncFormatter(dinh_dang_truc_tien))
+    ax.grid(axis="y", alpha=0.22)
+    ax.legend(frameon=False, ncols=3, loc="upper left")
+    fig.tight_layout()
     return fig
 
 
-def bieu_do_so_sanh(cac_ket_qua: dict[str, KetQuaMoPhong]) -> go.Figure:
+def bieu_do_so_sanh(cac_ket_qua: dict[str, KetQuaMoPhong]):
     ten = list(cac_ket_qua)
     tong_von = [cac_ket_qua[k].tong_von[-1] for k in ten]
     trung_vi = [cac_ket_qua[k].trung_vi for k in ten]
+    x = np.arange(len(ten))
+    rong = 0.36
 
-    fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=ten,
-            y=tong_von,
-            name="Tổng vốn góp",
-            marker_color="#94A3B8",
-            text=[dinh_dang_vnd(x) for x in tong_von],
-            textposition="outside",
-        )
+    fig, ax = plt.subplots(figsize=(11, 5.8))
+    fig.patch.set_facecolor("white")
+    cot_von = ax.bar(x - rong / 2, tong_von, rong, color="#94A3B8",
+                     label="Tổng vốn góp")
+    cot_trung_vi = ax.bar(
+        x + rong / 2,
+        trung_vi,
+        rong,
+        color=[MAU_KENH.get(k, "#2563EB") for k in ten],
+        label="Giá trị cuối kỳ trung vị",
     )
-    fig.add_trace(
-        go.Bar(
-            x=ten,
-            y=trung_vi,
-            name="Giá trị cuối kỳ trung vị",
-            marker_color=[MAU_KENH.get(k, "#2563EB") for k in ten],
-            text=[dinh_dang_vnd(x) for x in trung_vi],
-            textposition="outside",
-        )
-    )
-    fig.update_layout(
-        title="So sánh vốn góp và giá trị cuối kỳ",
-        yaxis_title="VND",
-        barmode="group",
-        template="plotly_white",
-        legend={"orientation": "h", "y": -0.22},
-        margin={"l": 20, "r": 20, "t": 60, "b": 100},
-    )
+    ax.bar_label(cot_von, labels=[dinh_dang_vnd(v) for v in tong_von],
+                 fontsize=8, padding=3, rotation=15)
+    ax.bar_label(cot_trung_vi, labels=[dinh_dang_vnd(v) for v in trung_vi],
+                 fontsize=8, padding=3, rotation=15)
+    ax.set_title("So sánh vốn góp và giá trị cuối kỳ", fontweight="bold")
+    ax.set_xticks(x, ten, rotation=12, ha="right")
+    ax.set_ylabel("Giá trị")
+    ax.yaxis.set_major_formatter(FuncFormatter(dinh_dang_truc_tien))
+    ax.grid(axis="y", alpha=0.22)
+    ax.legend(frameon=False, ncols=2, loc="upper left")
+    ax.margins(y=0.18)
+    fig.tight_layout()
     return fig
 
 
-def bieu_do_phan_phoi(ket_qua: KetQuaMoPhong) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Histogram(
-            x=ket_qua.gia_tri_cuoi,
-            nbinsx=50,
-            marker_color=MAU_KENH.get(ket_qua.ten_kenh, "#2563EB"),
-            opacity=0.82,
-            name="Số kịch bản",
-        )
+def bieu_do_phan_phoi(ket_qua: KetQuaMoPhong):
+    fig, ax = plt.subplots(figsize=(11, 5.2))
+    fig.patch.set_facecolor("white")
+    ax.hist(
+        ket_qua.gia_tri_cuoi,
+        bins=50,
+        color=MAU_KENH.get(ket_qua.ten_kenh, "#2563EB"),
+        alpha=0.82,
     )
-    fig.add_vline(
-        x=ket_qua.tong_von[-1],
-        line_dash="dash",
-        line_color="#DC2626",
-        annotation_text="Tổng vốn góp",
-    )
-    fig.add_vline(
-        x=ket_qua.trung_vi,
-        line_dash="solid",
-        line_color="#111827",
-        annotation_text="Trung vị",
-    )
-    fig.update_layout(
-        title=f"Phân phối giá trị cuối kỳ — {ket_qua.ten_kenh}",
-        xaxis_title="Giá trị cuối kỳ (VND)",
-        yaxis_title="Số kịch bản",
-        template="plotly_white",
-        showlegend=False,
-        margin={"l": 20, "r": 20, "t": 60, "b": 40},
-    )
+    ax.axvline(ket_qua.tong_von[-1], color="#DC2626", linestyle="--",
+               linewidth=2, label="Tổng vốn góp")
+    ax.axvline(ket_qua.trung_vi, color="#111827", linewidth=2,
+               label="Trung vị")
+    ax.set_title(f"Phân phối giá trị cuối kỳ — {ket_qua.ten_kenh}",
+                 fontweight="bold")
+    ax.set_xlabel("Giá trị cuối kỳ")
+    ax.set_ylabel("Số kịch bản")
+    ax.xaxis.set_major_formatter(FuncFormatter(dinh_dang_truc_tien))
+    ax.grid(axis="y", alpha=0.22)
+    ax.legend(frameon=False)
+    fig.tight_layout()
     return fig
 
 
@@ -435,7 +426,7 @@ if bat_dau:
 
                 try:
                     loi_suat, nguon = tai_loi_suat_thang(
-                        KENH_THI_TRUONG[ten_kenh], giai_doan
+                        ten_kenh, KENH_THI_TRUONG[ten_kenh], giai_doan
                     )
                     cac_ket_qua[ten_kenh] = mo_phong_tu_loi_suat(
                         ten_kenh=ten_kenh,
@@ -495,7 +486,22 @@ if "cac_ket_qua" in st.session_state:
             },
         )
 
-        st.plotly_chart(bieu_do_so_sanh(cac_ket_qua), width="stretch")
+        nguon_du_phong = [
+            ten
+            for ten, ket_qua in cac_ket_qua.items()
+            if "dự phòng" in ket_qua.nguon_du_lieu
+        ]
+        if nguon_du_phong:
+            st.warning(
+                "Yahoo Finance đang tạm thời không phản hồi cho: "
+                + ", ".join(nguon_du_phong)
+                + ". Ứng dụng đã tự dùng bản dữ liệu lịch sử đóng gói."
+            )
+
+        with KHOA_MATPLOTLIB:
+            hinh_so_sanh = bieu_do_so_sanh(cac_ket_qua)
+            st.pyplot(hinh_so_sanh, width="stretch")
+            plt.close(hinh_so_sanh)
 
         kenh_chi_tiet = st.selectbox(
             "Chọn kênh để xem chi tiết", list(cac_ket_qua.keys())
@@ -526,8 +532,14 @@ if "cac_ket_qua" in st.session_state:
             unsafe_allow_html=True,
         )
 
-        st.plotly_chart(bieu_do_dai_kich_ban(ket_qua), width="stretch")
-        st.plotly_chart(bieu_do_phan_phoi(ket_qua), width="stretch")
+        with KHOA_MATPLOTLIB:
+            hinh_dai = bieu_do_dai_kich_ban(ket_qua)
+            st.pyplot(hinh_dai, width="stretch")
+            plt.close(hinh_dai)
+
+            hinh_phan_phoi = bieu_do_phan_phoi(ket_qua)
+            st.pyplot(hinh_phan_phoi, width="stretch")
+            plt.close(hinh_phan_phoi)
 
         st.caption(f"Nguồn/giả định cho {kenh_chi_tiet}: {ket_qua.nguon_du_lieu}")
 
