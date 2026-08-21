@@ -13,6 +13,7 @@ phương pháp lấy mẫu ngẫu nhiên có hoàn lại để tạo nhiều k�
 - Tính xác suất giá trị cuối kỳ thấp hơn tổng vốn đã góp.
 - Biểu đồ dải kịch bản, so sánh kênh và phân phối giá trị cuối kỳ.
 - Tải dữ liệu mới và lưu cache trong 6 giờ.
+- Tự dùng bản dữ liệu lịch sử dự phòng khi Yahoo Finance tạm thời không phản hồi.
 
 ## Chạy cục bộ
 
